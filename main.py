@@ -14,71 +14,6 @@ scanning_active = {}
 current_results = {}
 user_operations = {}
 waiting_proxy_url = set()
-file_upload_mode = set()
-waitingFull = set()
-
-# ========== الدوال الجديدة ==========
-def stop_user_operations(chat_id):
-    """إيقاف أي عملية جارية للمستخدم بشكل آمن"""
-    if chat_id in user_operations:
-        user_operations[chat_id]['stop'] = True
-    file_upload_mode.discard(chat_id)
-    waitingFull.discard(chat_id)
-    waiting_proxy_url.discard(chat_id)
-    if chat_id in scanning_active:
-        scanning_active[chat_id] = False
-
-def should_stop(chat_id):
-    """تعيد True إذا كان المستخدم قد طلب إيقاف أي عملية جارية"""
-    return user_operations.get(chat_id, {}).get('stop', False)
-
-def fetch_proxies_from_url(url):
-    """جلب البروكسيات من رابط"""
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        
-        proxies = []
-        for line in response.text.split('\n'):
-            line = line.strip()
-            if ':' in line and any(c.isdigit() for c in line):
-                parts = line.split(':')
-                if len(parts) >= 2:
-                    ip = parts[0].strip()
-                    port = parts[1].strip()
-                    if ip and port.isdigit():
-                        proxies.append(f"{ip}:{port}")
-        return proxies
-    except Exception as e:
-        print(f"Error fetching proxies from URL: {e}")
-        return []
-
-def process_custom_proxies_scan(chat_id, custom_url):
-    """جلب البروكسيات من رابط وفحصها تلقائيًا"""
-    # تهيئة عملية المستخدم
-    user_operations[chat_id] = {'stop': False}
-    
-    progress_msg = bot.send_message(chat_id, "🔍 **جاري جلب البروكسيات...**")
-    
-    if should_stop(chat_id):
-        return
-    
-    # جلب البروكسيات من الرابط
-    proxies = fetch_proxies_from_url(custom_url)
-    if not proxies:
-        bot.send_message(chat_id, "❌ لم يتم العثور على بروكسيات")
-        return
-    
-    if should_stop(chat_id):
-        return
-    
-    bot.edit_message_text(
-        f"🌐 **تم جلب {len(proxies)} بروكسي**\n🚀 **بدء الفحص...**", 
-        chat_id, progress_msg.message_id
-    )
-    
-    # بدء الفحص
-    process_scan_request_with_list(chat_id, proxies)
 
 # ========== الدوال الأساسية ==========
 def create_stop_keyboard():
@@ -92,6 +27,18 @@ def create_main_keyboard():
     keyboard.add(KeyboardButton("📁 رفع ملف txt"))
     keyboard.add(KeyboardButton("🌐 فحص عبر الرابط"))
     return keyboard
+
+def stop_user_operations(chat_id):
+    """إيقاف أي عملية جارية للمستخدم بشكل آمن"""
+    if chat_id in user_operations:
+        user_operations[chat_id]['stop'] = True
+    waiting_proxy_url.discard(chat_id)
+    if chat_id in scanning_active:
+        scanning_active[chat_id] = False
+
+def should_stop(chat_id):
+    """تعيد True إذا كان المستخدم قد طلب إيقاف أي عملية جارية"""
+    return user_operations.get(chat_id, {}).get('stop', False)
 
 def extract_ip_port(proxy_text):
     """استخراج IP و PORT من النص - محسن لدعم الروابط"""
@@ -266,15 +213,37 @@ def format_proxy_result(proxy, index):
    {response_time} • {protocol_port}
     """
 
-def update_progress_message(bot, chat_id, user_id, total, checked, working, message_id=None):
-    """تحديث رسالة التقدم"""
-    if should_stop(user_id):
-        return None
+def check_proxies_list(proxies_list, user_id, chat_id, bot):
+    """فحص قائمة بروكسيات مع تحديث التقدم - الإصدار النهائي"""
+    working_proxies = []
+    google_proxies = []
     
-    progress = (checked / total) * 100 if total > 0 else 0
-    progress_bar = "🟢" * int(progress / 10) + "⚪" * (10 - int(progress / 10))
+    total = len(proxies_list)
+    checked = 0
+    working = 0
     
-    progress_text = f"""
+    # إرسال رسالة التقدم الأولى
+    progress_message = bot.send_message(chat_id, "⏳ بدء الفحص...", reply_markup=create_stop_keyboard())
+    
+    # فحص تسلسلي بسيط مع تحديث العداد
+    for proxy in proxies_list:
+        if should_stop(user_id):
+            break
+            
+        proxy_data, error = check_single_proxy(proxy, user_id)
+        checked += 1
+        
+        if proxy_data:
+            working += 1
+            working_proxies.append(proxy_data)
+            if proxy_data['is_google']:
+                google_proxies.append(proxy_data)
+        
+        # تحديث العداد بعد كل بروكسي
+        progress = (checked / total) * 100
+        progress_bar = "🟢" * int(progress / 10) + "⚪" * (10 - int(progress / 10))
+        
+        progress_text = f"""
 ⏳ جاري الفحص...
 {progress_bar} {progress:.1f}%
 
@@ -283,61 +252,61 @@ def update_progress_message(bot, chat_id, user_id, total, checked, working, mess
 • 🔍 تم فحص: {checked}
 • ✅ الشغالة: {working}
 • ⏳ المتبقي: {total - checked}
-    """
-    
-    try:
-        if message_id:
-            bot.edit_message_text(progress_text, chat_id, message_id, reply_markup=create_stop_keyboard())
-            return message_id
-        else:
-            msg = bot.send_message(chat_id, progress_text, reply_markup=create_stop_keyboard())
-            return msg.message_id
-    except:
-        return message_id
-
-def check_proxies_list(proxies_list, user_id, chat_id, bot):
-    """فحص قائمة بروكسيات مع تحديث التقدم"""
-    working_proxies = []
-    google_proxies = []
-    
-    total = len(proxies_list)
-    checked = 0
-    working = 0
-    
-    current_results[user_id] = {'working': [], 'google': []}
-    user_operations[user_id] = {'stop': False}
-    
-    progress_message_id = update_progress_message(bot, chat_id, user_id, total, checked, working)
-    last_update = time.time()
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_proxy = {executor.submit(check_single_proxy, proxy, user_id): proxy for proxy in proxies_list}
+        """
         
-        for future in concurrent.futures.as_completed(future_to_proxy):
-            if should_stop(user_id):
-                for f in future_to_proxy: f.cancel()
-                break
-                
-            proxy_data, error = future.result()
-            checked += 1
-            
-            if proxy_data:
-                working += 1
-                working_proxies.append(proxy_data)
-                current_results[user_id]['working'].append(proxy_data)
-                if proxy_data['is_google']:
-                    google_proxies.append(proxy_data)
-                    current_results[user_id]['google'].append(proxy_data)
-            
-            current_time = time.time()
-            if current_time - last_update > 2 or checked % max(1, total//10) == 0 or checked == total:
-                progress_message_id = update_progress_message(bot, chat_id, user_id, total, checked, working, progress_message_id)
-                last_update = current_time
-    
-    if user_id in current_results: del current_results[user_id]
-    if user_id in user_operations: del user_operations[user_id]
+        try:
+            bot.edit_message_text(progress_text, chat_id, progress_message.message_id, reply_markup=create_stop_keyboard())
+        except:
+            pass
+        
+        time.sleep(0.05)  # وقت بسيط بين كل فحص
     
     return working_proxies, google_proxies
+
+def fetch_proxies_from_url(url):
+    """جلب البروكسيات من رابط"""
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        
+        proxies = []
+        for line in response.text.split('\n'):
+            line = line.strip()
+            if ':' in line and any(c.isdigit() for c in line):
+                parts = line.split(':')
+                if len(parts) >= 2:
+                    ip = parts[0].strip()
+                    port = parts[1].strip()
+                    if ip and port.isdigit():
+                        proxies.append(f"{ip}:{port}")
+        return proxies
+    except Exception as e:
+        print(f"Error fetching proxies from URL: {e}")
+        return []
+
+def process_custom_proxies_scan(chat_id, custom_url):
+    """جلب البروكسيات من رابط وفحصها تلقائيًا"""
+    user_operations[chat_id] = {'stop': False}
+    
+    progress_msg = bot.send_message(chat_id, "🔍 **جاري جلب البروكسيات...**")
+    
+    if should_stop(chat_id):
+        return
+    
+    proxies = fetch_proxies_from_url(custom_url)
+    if not proxies:
+        bot.send_message(chat_id, "❌ لم يتم العثور على بروكسيات")
+        return
+    
+    if should_stop(chat_id):
+        return
+    
+    bot.edit_message_text(
+        f"🌐 **تم جلب {len(proxies)} بروكسي**\n🚀 **بدء الفحص...**", 
+        chat_id, progress_msg.message_id
+    )
+    
+    process_scan_request_with_list(chat_id, proxies)
 
 # ========== معالجات البوت ==========
 @bot.message_handler(commands=['start'])
@@ -424,12 +393,9 @@ def process_file_upload(message):
 
 def process_scan_request_with_list(chat_id, proxies_list):
     user_id = chat_id
+    user_operations[user_id] = {'stop': False}
     
     try:
-        if len(proxies_list) > 500:
-            bot.send_message(chat_id, "❌ الحد الأقصى 500 بروكسي")
-            return
-        
         scanning_active[user_id] = True
         bot.send_message(chat_id, f"🔍 بدء فحص {len(proxies_list)} بروكسي...", reply_markup=create_stop_keyboard())
         
@@ -441,6 +407,8 @@ def process_scan_request_with_list(chat_id, proxies_list):
     finally:
         if user_id in scanning_active:
             scanning_active[user_id] = False
+        if user_id in user_operations:
+            del user_operations[user_id]
 
 def process_scan_request(message):
     chat_id = message.chat.id
@@ -500,6 +468,6 @@ def handle_all_messages(message):
         bot.send_message(chat_id, "📝 اختر أحد الخيارات من الأزرار", reply_markup=create_main_keyboard())
 
 if __name__ == "__main__":
-    print("🟢 بدء تشغيل بوت فحص البروكسيات المحسن...")
-    print("⚡ المميزات: فحص روابط، رفع ملفات، إيقاف ذكي")
+    print("🟢 بدء تشغيل بوت فحص البروكسيات النهائي...")
+    print("⚡ المميزات: عداد عامل، إيقاف فوري، فحص روابط")
     bot.infinity_polling()
